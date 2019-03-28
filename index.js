@@ -1,71 +1,98 @@
-'use strict'
+var async = require('async');
+var AWS = require('aws-sdk');
+var gm = require('gm')
+            .subClass({ imageMagick: true }); // Enable ImageMagick integration.
+var util = require('util');
 
+var MAX_WIDTH  = 100;
+var MAX_HEIGHT = 100;
 
-const AWS = require('aws-sdk')
-const S3 = new AWS.S3({signatureVersion: 'v4'});
-const Sharp = require('sharp');
-const PathPattern = new RegExp("(.*/)?(.*)/(.*)");
+var s3 = new AWS.S3();
+ 
+exports.handler = function(event, context, callback) {
+    // Read options from the event.
+    console.log("Reading options from event:\n", util.inspect(event, {depth: 5}));
+    var srcBucket = event.Records[0].s3.bucket.name;
+    // Object key may have spaces or unicode non-ASCII characters.
+    var srcKey    =
+    decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, " "));  
+    var dstBucket = srcBucket + "resized";
+    var dstKey    = "resized-" + srcKey;
 
-// parameters
-const {BUCKET, URL} = process.env
+    // Sanity check: validate that source and destination are different buckets.
+    if (srcBucket == dstBucket) {
+        callback("Source and destination buckets are the same.");
+        return;
+    }
 
+    // Infer the image type.
+    var typeMatch = srcKey.match(/\.([^.]*)$/);
+    if (!typeMatch) {
+        callback("Could not determine the image type.");
+        return;
+    }
+    var imageType = typeMatch[1];
+    if (imageType != "jpg" && imageType != "png") {
+        callback('Unsupported image type: ${imageType}');
+        return;
+    }
 
-exports.handler = function(event, _context, callback) {
-    var path = event.queryStringParameters.path;
-    var parts = PathPattern.exec(path);
-    var dir = parts[1] || '';
-    var options = parts[2].split('_');
-    var filename = parts[3];
+    // Download the image from S3, transform, and upload to a different S3 bucket.
+    async.waterfall([
+        function download(next) {
+            // Download the image from S3 into a buffer.
+            s3.getObject({
+                    Bucket: srcBucket,
+                    Key: srcKey
+                },
+                next);
+            },
+        function transform(response, next) {
+            gm(response.Body).size(function(err, size) {
+                // Infer the scaling factor to avoid stretching the image unnaturally.
+                var scalingFactor = Math.min(
+                    MAX_WIDTH / size.width,
+                    MAX_HEIGHT / size.height
+                );
+                var width  = scalingFactor * size.width;
+                var height = scalingFactor * size.height;
 
-
-    var sizes = options[0].split("x");
-    var func = options.length > 1 ? options[1] : null;
-
-    var contentType;
-    S3.getObject({Bucket: BUCKET, Key: dir + filename})
-        .promise()
-        .then(data => {
-            contentType = data.ContentType;
-            var img = Sharp(data.Body)
-                .resize(
-                    sizes[0] === 'AUTO' ? null : parseInt(sizes[0]),
-                    sizes[1] === 'AUTO' ? null : parseInt(sizes[1]));
-
-            switch (func){
-                case 'max': img = img.max(); break;
-                case 'min': img = img.min(); break;
-                case null: break;
-                default:
-                    callback(null, {
-                        statusCode: 400,
-                        body: `Unknown func parameter "${func}"\n` +
-                              'For query ".../150x150_func", "_func" must be either empty, "_min" or "_max"',
-                        headers: {"Content-Type": "text/plain"}
-                    })
-                    return new Promise(() => {})  // the next then-blocks will never be executed
+                // Transform the image buffer in memory.
+                this.resize(width, height)
+                    .toBuffer(imageType, function(err, buffer) {
+                        if (err) {
+                            next(err);
+                        } else {
+                            next(null, response.ContentType, buffer);
+                        }
+                    });
+            });
+        },
+        function upload(contentType, data, next) {
+            // Stream the transformed image to a different S3 bucket.
+            s3.putObject({
+                    Bucket: dstBucket,
+                    Key: dstKey,
+                    Body: data,
+                    ContentType: contentType
+                },
+                next);
+            }
+        ], function (err) {
+            if (err) {
+                console.error(
+                    'Unable to resize ' + srcBucket + '/' + srcKey +
+                    ' and upload to ' + dstBucket + '/' + dstKey +
+                    ' due to an error: ' + err
+                );
+            } else {
+                console.log(
+                    'Successfully resized ' + srcBucket + '/' + srcKey +
+                    ' and uploaded to ' + dstBucket + '/' + dstKey
+                );
             }
 
-            return img.withoutEnlargement().toBuffer();
-        })
-        .then(result =>
-            S3.putObject({
-                Body: result,
-                Bucket: BUCKET,
-                ContentType: contentType,
-                Key: path
-            }).promise()
-        )
-        .then(() =>
-            callback(null, {
-                statusCode: 301,
-                headers: {"Location" : `${URL}/${path}`}
-            })
-        )
-        .catch(e => {
-            callback(null, {
-                statusCode: e.statusCode || 400,
-                body: 'Exception: ' + e.message,
-                headers: {"Content-Type": "text/plain"}
-            })
-        });
-}
+            callback(null, "message");
+        }
+    );
+};
