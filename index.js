@@ -42,7 +42,7 @@ exports.handler = function(event, context, callback) {
         function download(next) {
             // Download the image from S3 into a buffer.
             s3.getObject({
-                    Bucket: srcBucket,
+                    Bucket: lambda-bucket-resize,
                     Key: srcKey
                 },
                 next);
